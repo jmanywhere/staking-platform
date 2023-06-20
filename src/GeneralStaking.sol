@@ -14,7 +14,12 @@ import "@openzeppelin/security/ReentrancyGuard.sol";
 error GeneralStaking__InsufficientDepositAmount();
 error GeneralStaking__InvalidPoolId(uint256 _poolId);
 error GeneralStaking__InvalidTransferFrom();
+error GeneralStaking__InvalidTransfer();
 error GeneralStaking__InvalidPoolApr(uint256 _poolApr);
+error GeneralStaking__InvalidWithdrawLockPeriod(uint256 _withdrawLockPeriod);
+error GeneralStaking__InvalidAmount();
+error GeneralStaking__InvalidEarlyWithdrawFee();
+error GeneralStaking__InvalidSettings();
 
 //---------------------------------------------
 //   Main Contract
@@ -60,8 +65,10 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
     IERC20 public token; // Main token reward to be distributed
     uint256 public totalPools; // Total amount of pools
     uint256 public rewardTokens; // Amount of tokens to be distributed
+    uint256 public constant FEE_BASE = 100;
     uint256 public constant BASE_APR = 100_00; // 100% APR
-    uint256 public startTimeStamp;
+    uint256 public constant APR_TIME = 365 days;
+    uint256 public constant REWARD_DENOMINATOR = 100_00 * 365 days;
     uint256 public totalLockedUpRewards;
     uint256 public earlyWithdrawFee = 10;
 
@@ -84,19 +91,22 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
     event TreasureRecovered();
     event MarketingWalletUpdate();
     event RewardUpdate();
-    event EarlyWithdrawalUpdate();
+    event EarlyWithdrawalUpdate(uint _old, uint _new);
     event TreasureAdded();
     event RewardsPaid();
     event PoolUpdated();
-    event PoolSet();
+    event EditPool(
+        uint indexed poolId,
+        uint256 newApr,
+        uint256 newWithdrawLockPeriod
+    );
     event PoolAdd(uint _poolIdAdded);
 
     //---------------------------------------------
     //   Constructor
     //---------------------------------------------
-    constructor(address _rewardToken, uint256 _startTimestamp) {
+    constructor(address _rewardToken) {
         token = IERC20(_rewardToken);
-        startTimeStamp = _startTimestamp;
     }
 
     //---------------------------------------------
@@ -104,14 +114,15 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
     //---------------------------------------------
     function deposit(uint _pid, uint amount) external nonReentrant {
         if (amount == 0) revert GeneralStaking__InsufficientDepositAmount();
-        if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
+
+        PoolInfo storage pool = poolInfo[_pid];
+
+        if (_pid > totalPools || pool.poolApr == 0)
+            revert GeneralStaking__InvalidPoolId(_pid);
 
         UserInfo storage user = userInfo[_pid][msg.sender];
-        PoolInfo storage pool = poolInfo[_pid];
-        if (pool.poolApr == 0) revert GeneralStaking__InvalidPoolId(_pid);
-        _updatePool(_pid);
 
-        // TODO check if user has already deposited and claim any rewards pending
+        _updateAndPayOrLock(msg.sender, _pid);
 
         user.depositAmount += amount;
 
@@ -126,7 +137,35 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         emit Deposit(msg.sender, _pid, amount);
     }
 
-    function withdraw(uint _pid) external nonReentrant {}
+    function withdraw(uint _pid) external nonReentrant {
+        if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        _updateAndPayOrLock(msg.sender, _pid);
+
+        uint256 amount = user.depositAmount;
+        uint penalty = 0;
+
+        if (!_canHarvest(user.lastDeposit, pool.withdrawLockPeriod)) {
+            rewardTokens += user.rewardLockedUp;
+            penalty = (amount * earlyWithdrawFee) / FEE_BASE;
+            amount -= penalty;
+        }
+        pool.totalDeposit -= user.depositAmount;
+
+        userInfo[_pid][msg.sender] = UserInfo({
+            depositAmount: 0,
+            rewardDebt: 0,
+            rewardLockedUp: 0,
+            lastInteraction: block.timestamp,
+            lastDeposit: 0
+        });
+
+        _safeTokenTransfer(msg.sender, amount);
+        if (penalty > 0) _safeTokenTransfer(marketingAddress, penalty);
+        emit Withdraw(msg.sender, _pid, amount);
+    }
 
     function emergencyWithdraw(uint _pid) external nonReentrant {}
 
@@ -142,6 +181,10 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         uint256 _withdrawLockPeriod
     ) external onlyOwner {
         if (_poolApr == 0) revert GeneralStaking__InvalidPoolApr(_poolApr);
+        if (_withdrawLockPeriod > 365)
+            revert GeneralStaking__InvalidWithdrawLockPeriod(
+                _withdrawLockPeriod
+            );
         _withdrawLockPeriod *= 1 days; // value in seconds
 
         poolInfo[totalPools] = PoolInfo({
@@ -156,28 +199,80 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         totalPools++;
     }
 
+    /**
+     *
+     * @param _poolId The id to edit
+     * @param _poolApr the new pool APR, if 0, the pool is disabled to deposit
+     * @param _withdrawLockPeriod the new lock period. if 0, lock is removed. I think max should be 1 year.
+     */
     function editPool(
         uint256 _poolId,
         uint256 _poolApr,
         uint256 _withdrawLockPeriod
-    ) external onlyOwner {}
+    ) external onlyOwner {
+        if (_poolId > totalPools) revert GeneralStaking__InvalidPoolId(_poolId);
+        if (_withdrawLockPeriod > 365)
+            revert GeneralStaking__InvalidWithdrawLockPeriod(
+                _withdrawLockPeriod
+            );
+        _updatePool(_poolId);
+        _withdrawLockPeriod *= 1 days; // value in seconds
+        poolInfo[_poolId].poolApr = _poolApr;
+        poolInfo[_poolId].withdrawLockPeriod = _withdrawLockPeriod;
+        emit EditPool(_poolId, _poolApr, _withdrawLockPeriod);
+    }
 
-    function setMarketingAddress(
-        address _marketingAddress
-    ) external onlyOwner {}
+    /**
+     * @param _marketingAddress The new address to send marketing funds to
+     */
+    function setMarketingAddress(address _marketingAddress) external onlyOwner {
+        marketingAddress = _marketingAddress;
+        emit MarketingWalletUpdate();
+    }
 
-    function setEarlyWithdrawFee(
-        uint256 _earlyWithdrawFee
-    ) external onlyOwner {}
+    /**
+     * @param _earlyWithdrawFee The new fee to be charged for early withdraws
+     */
+    function setEarlyWithdrawFee(uint256 _earlyWithdrawFee) external onlyOwner {
+        if (_earlyWithdrawFee > 20)
+            revert GeneralStaking__InvalidEarlyWithdrawFee();
+        emit EarlyWithdrawalUpdate(earlyWithdrawFee, _earlyWithdrawFee);
+        earlyWithdrawFee = _earlyWithdrawFee;
+    }
 
-    function recoverTreasure(address _to) external onlyOwner {}
+    /**
+     * Last resort to recover any tokens that were destined for rewards
+     * @param _to The address to send the tokens to
+     */
+    function recoverTreasure(address _to) external onlyOwner {
+        if (_to == address(0) || rewardTokens == 0)
+            revert GeneralStaking__InvalidSettings();
+        if (!token.transfer(_to, rewardTokens))
+            revert GeneralStaking__InvalidTransfer();
+        rewardTokens = 0;
+        emit TreasureRecovered();
+    }
 
-    function addRewardTokens(uint256 _rewardTokens) external onlyOwner {}
+    /**
+     * Add tokens for rewards in the pool
+     * @param _rewardTokens The amount of tokens to add to the reward pool
+     */
+    function addRewardTokens(uint256 _rewardTokens) external {
+        if (_rewardTokens == 0) revert GeneralStaking__InvalidAmount();
+        rewardTokens += _rewardTokens;
+
+        if (!token.transferFrom(msg.sender, address(this), _rewardTokens))
+            revert GeneralStaking__InvalidTransferFrom();
+    }
 
     //---------------------------------------------
     //   Internal Functions
     //---------------------------------------------
-
+    /**
+     *
+     * @param _poolId The pool ID to update values for
+     * @dev Updates the current pool reward amount
+     */
     function _updatePool(uint256 _poolId) internal {
         PoolInfo storage pool = poolInfo[_poolId];
 
@@ -188,6 +283,52 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         }
         pool.lastUpdate = block.timestamp;
         return;
+    }
+
+    /**
+     * @notice This function exists to prevent rounding error issues
+     * @param _to Address to send the funds to
+     * @param _amount amount of Reward Token to send to _to address
+     */
+    function _safeTokenTransfer(address _to, uint256 _amount) internal {
+        uint256 tokenBal = token.balanceOf(address(this));
+        if (_amount > tokenBal) {
+            token.transfer(_to, tokenBal);
+        } else {
+            token.transfer(_to, _amount);
+        }
+    }
+
+    function _payOrLockTokens(address _user, uint _pid) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][_user];
+
+        uint pending = ((pool.accAprOverTime * user.depositAmount) -
+            user.rewardDebt) / REWARD_DENOMINATOR;
+
+        if (_canHarvest(user.lastDeposit, pool.withdrawLockPeriod)) {
+            if (pending > 0 || user.rewardLockedUp > 0) {
+                pending += user.rewardLockedUp;
+                user.rewardLockedUp = 0;
+                _safeTokenTransfer(_user, pending);
+                emit RewardsPaid();
+            } else if (pending > 0) {
+                user.rewardLockedUp += pending;
+                emit RewardLockedUp(_user, _pid, pending);
+            }
+        }
+    }
+
+    function _updateAndPayOrLock(address _user, uint _pid) internal {
+        _updatePool(_pid);
+        _payOrLockTokens(_user, _pid);
+    }
+
+    function _canHarvest(
+        uint lastDeposit,
+        uint withdrawLock
+    ) internal view returns (bool) {
+        return lastDeposit + withdrawLock < block.timestamp;
     }
 
     //---------------------------------------------
@@ -208,13 +349,19 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
                 (poolInfo[i].poolApr * poolInfo[i].totalDeposit) /
                 (BASE_APR * 365 days);
         }
+        if (rewardsPerSecond == 0 || rewardTokens == 0) return 0;
         return rewardTokens / rewardsPerSecond;
     }
 
+    /**
+     * @notice This function returns the pending Rewards for a specific user in a pool
+     * @param _pid The pool Id to check
+     * @param _userAddress The user address to check
+     */
     function pendingReward(
         uint _pid,
         address _userAddress
-    ) public view returns (uint256) {
+    ) external view returns (uint256) {
         if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_userAddress];
@@ -230,6 +377,6 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
 
         return
             ((accAprOverTime * user.depositAmount) - user.rewardDebt) /
-            BASE_APR;
+            (REWARD_DENOMINATOR);
     }
 }
