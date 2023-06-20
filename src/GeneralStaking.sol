@@ -105,13 +105,20 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
     //---------------------------------------------
     //   Constructor
     //---------------------------------------------
-    constructor(address _rewardToken) {
+    constructor(address _rewardToken, address _marketing) {
         token = IERC20(_rewardToken);
+        marketingAddress = _marketing;
     }
 
     //---------------------------------------------
     //   External Functions
     //---------------------------------------------
+
+    /**
+     * @notice Deposit tokens into a pool
+     * @param _pid Pool ID to deposit in
+     * @param amount Amount of TOKEN to deposit
+     */
     function deposit(uint _pid, uint amount) external nonReentrant {
         if (amount == 0) revert GeneralStaking__InsufficientDepositAmount();
 
@@ -137,6 +144,10 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         emit Deposit(msg.sender, _pid, amount);
     }
 
+    /**
+     * @notice Withdraw all deposited tokens from pool
+     * @param _pid Pool ID to withdraw from
+     */
     function withdraw(uint _pid) external nonReentrant {
         if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
         PoolInfo storage pool = poolInfo[_pid];
@@ -167,9 +178,44 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         emit Withdraw(msg.sender, _pid, amount);
     }
 
-    function emergencyWithdraw(uint _pid) external nonReentrant {}
+    /**
+     * @notice Withdraw all deposited tokens from the pool disregarding the lock period and rewards
+     * @param _pid Pool ID to withdraw from
+     */
+    function emergencyWithdraw(uint _pid) external nonReentrant {
+        if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
 
-    function harvest(uint _pid) external nonReentrant {}
+        uint256 amount = user.depositAmount;
+        pool.totalDeposit -= user.depositAmount;
+
+        if(user.rewardLockedUp > 0) {
+            // free up the locked up rewards
+            rewardTokens += user.rewardLockedUp;
+        }
+
+        userInfo[_pid][msg.sender] = UserInfo({
+            depositAmount: 0,
+            rewardDebt: 0,
+            rewardLockedUp: 0,
+            lastInteraction: block.timestamp,
+            lastDeposit: 0
+        });
+
+        _safeTokenTransfer(msg.sender, amount);
+        emit EmergencyWithdraw(msg.sender, _pid, amount);
+    }
+
+    /**
+     * @notice Harvest rewards from a pool
+     * @param _pid Pool ID to harvest from
+     * @dev If user still cant harvest, it will lock the rewards for the user until lock is lifted
+     */
+    function harvest(uint _pid) external nonReentrant {
+        if (_pid > totalPools) revert GeneralStaking__InvalidPoolId(_pid);
+        _updateAndPayOrLock(msg.sender, _pid);
+    }
 
     /**
      * @notice add a pool to the list with the given APR and withdraw lock period
@@ -306,16 +352,18 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
         uint pending = ((pool.accAprOverTime * user.depositAmount) -
             user.rewardDebt) / REWARD_DENOMINATOR;
 
+        rewardTokens -= pending; // remove pending tokens from reward pool
+
         if (_canHarvest(user.lastDeposit, pool.withdrawLockPeriod)) {
             if (pending > 0 || user.rewardLockedUp > 0) {
                 pending += user.rewardLockedUp;
                 user.rewardLockedUp = 0;
                 _safeTokenTransfer(_user, pending);
                 emit RewardsPaid();
-            } else if (pending > 0) {
-                user.rewardLockedUp += pending;
-                emit RewardLockedUp(_user, _pid, pending);
             }
+        } else if (pending > 0) {
+            user.rewardLockedUp += pending;
+            emit RewardLockedUp(_user, _pid, pending);
         }
     }
 
@@ -338,9 +386,11 @@ contract GeneralStaking is Ownable, ReentrancyGuard {
     //---------------------------------------------
     //   External & Public View Functions
     //---------------------------------------------
-    /// @notice  Request an APPROXIMATE amount of time until the contract runs out of funds on rewards
-    /// @notice PLEASE NOTE THAT THIS IS AN APPROXIMATION, IT DOES NOT TAKE INTO ACCOUNT PENDING REWARDS NEEDED TO BE CLAIMED
-    /// @return Returns the amount of seconds when the contract runs out of funds
+    /**
+     *  @notice  Request an APPROXIMATE amount of time until the contract runs out of funds on rewards
+     *  @notice PLEASE NOTE THAT THIS IS AN APPROXIMATION, IT DOES NOT TAKE INTO ACCOUNT PENDING REWARDS NEEDED TO BE CLAIMED
+     *  @return Returns the amount of seconds when the contract runs out of funds
+     */
     function timeToEmpty() external view returns (uint256) {
         uint allPools = totalPools;
         uint rewardsPerSecond = 0;
